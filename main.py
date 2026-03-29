@@ -247,7 +247,12 @@ async def connectivity_test() -> dict:
                 body2 = await r2.text()
                 results["ge_submit"] = f"status={r2.status} location={loc[:80] if loc else 'none'} body_len={len(body2)}"
                 if r2.status == 200:
-                    results["ge_submit_body_snippet"] = body2[:300]
+                    # Look for error messages or captcha indicators
+                    import re as _re
+                    errors = _re.findall(r'(?:error|invalid|captcha|robot|blocked|failed)[^<"]{0,80}', body2, _re.IGNORECASE)
+                    results["ge_submit_errors"] = errors[:5]
+                    results["ge_submit_has_captcha"] = any(k in body2.lower() for k in ['captcha', 'recaptcha', 'hcaptcha', 'robot', 'human'])
+                    results["ge_submit_has_error_msg"] = any(k in body2.lower() for k in ['invalid', 'incorrect', 'failed', 'error'])
     except Exception as e:
         results["ge_login_flow"] = f"{type(e).__name__}: {e}"
     return results
