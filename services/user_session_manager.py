@@ -222,6 +222,54 @@ class UserSessionManager:
 
         return session
 
+    async def register_user_with_code(
+        self,
+        user_id: str,
+        auth_code: str,
+        fcm_token: str,
+    ) -> UserSession:
+        """Create (or replace) a session using a GE OAuth2 authorization code.
+
+        The phone completed the GE login in a WebView and sends us the
+        authorization code.  We exchange it for tokens here and connect to
+        SmartHQ without ever storing a username/password.
+        """
+        client = SmartHQService()
+        await client.start_with_auth_code(auth_code)
+
+        # Placeholder encrypted bytes (no password in this flow).
+        encrypted_pw = encrypt("oauth2")
+
+        session = UserSession(
+            user_id=user_id,
+            smarthq_username="oauth2",
+            _smarthq_password_enc=encrypted_pw,
+            fcm_token=fcm_token,
+            smarthq_client=client,
+        )
+
+        try:
+            appliances = await client.fetch_all_appliances()
+            for a in appliances:
+                session.appliances[a.id] = a
+                session.get_or_create_alarm_state(a.id)
+            session.last_poll = datetime.utcnow()
+            logger.info(
+                "user=%s registered via OAuth code. Discovered %d appliances.",
+                user_id,
+                len(appliances),
+            )
+        except Exception as exc:
+            logger.error("user=%s initial appliance fetch failed: %s", user_id, exc)
+
+        async with self._lock:
+            existing = self._sessions.get(user_id)
+            if existing is not None:
+                await self._close_session_client(existing)
+            self._sessions[user_id] = session
+
+        return session
+
     async def unregister_user(self, user_id: str) -> bool:
         """Remove the session for *user_id* and close its SmartHQ client.
 

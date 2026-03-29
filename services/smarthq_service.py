@@ -1,372 +1,354 @@
-"""SmartHQ Pro API service.
+"""SmartHQ service using gehomesdk WebSocket client.
 
-Fetches GE appliance state from the SmartHQ REST API and maps the raw
-payload to the internal Appliance model.
-
-Multi-user design
------------------
-``SmartHQService`` is now **instantiated per user** by the
-``UserSessionManager``.  Pass ``username`` and ``password`` directly to the
-constructor instead of reading them from global settings.
-
-The class still supports the legacy singleton pattern (used by the global
-``smarthq_service`` instance at the bottom of this module) so that the health
-check endpoint continues to work without changes.
-
-gehomesdk integration note
----------------------------
-The ``gehomesdk`` library (``pip install gehomesdk``) provides a higher-level
-async client for GE Appliances / SmartHQ via OAuth2.  If it is installed and
-you want to use it instead of the raw REST approach, replace the ``_login``
-and ``fetch_all_appliances`` implementations below with:
-
-    # TODO: gehomesdk integration
-    # from gehomesdk import GeApiClient
-    #
-    # client = GeApiClient(username, password)
-    # await client.async_login()
-    # raw_appliances = await client.async_get_appliances()
-    # for raw in raw_appliances:
-    #     appliance_id = str(raw.appliance_id)
-    #     name = raw.name or appliance_id
-    #     # Map raw.status to ApplianceStatus using _SMARTHQ_STATUS_MAP
-    #     ...
-
-The current implementation uses the SmartHQ REST API directly with httpx,
-which works without the SDK but requires a valid bearer token or
-username/password credentials.
-
-SmartHQ state → ApplianceStatus mapping
------------------------------------------
-SmartHQ "operationMode" or "applianceState" values seen in practice:
-
-  IDLE / STANDBY           → IDLE
-  RUNNING / IN_USE         → RUNNING
-  END_OF_CYCLE / COMPLETE  → DONE
-  FAULT / ERROR            → ERROR
-  anything else            → UNKNOWN
+Each user gets their own GeWebsocketClient that maintains a persistent
+WebSocket connection to GE's servers.  Appliance state is pushed in
+real-time — no polling needed.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional
-
-import httpx
+from typing import Any, Callable, Dict, List, Optional
 
 from models.appliance import Appliance, ApplianceStatus, ApplianceType
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# SmartHQ state vocabulary
+# Mapping helpers
 # ---------------------------------------------------------------------------
 
-_SMARTHQ_STATUS_MAP: Dict[str, ApplianceStatus] = {
-    # Idle / off
-    "IDLE": ApplianceStatus.IDLE,
-    "STANDBY": ApplianceStatus.IDLE,
-    "OFF": ApplianceStatus.IDLE,
-    "POWERED_OFF": ApplianceStatus.IDLE,
-    # Running
-    "RUNNING": ApplianceStatus.RUNNING,
-    "IN_USE": ApplianceStatus.RUNNING,
-    "ACTIVE": ApplianceStatus.RUNNING,
-    "SENSING": ApplianceStatus.RUNNING,
-    "DELAY_START": ApplianceStatus.RUNNING,
-    "PAUSED": ApplianceStatus.RUNNING,
-    # Done
-    "END_OF_CYCLE": ApplianceStatus.DONE,
-    "COMPLETE": ApplianceStatus.DONE,
-    "DONE": ApplianceStatus.DONE,
-    "FINISHED": ApplianceStatus.DONE,
-    # Errors
-    "FAULT": ApplianceStatus.ERROR,
-    "ERROR": ApplianceStatus.ERROR,
-}
-
-_SMARTHQ_TYPE_MAP: Dict[str, ApplianceType] = {
-    "washer": ApplianceType.WASHER,
-    "dryer": ApplianceType.DRYER,
-    "oven": ApplianceType.OVEN,
-    "range": ApplianceType.OVEN,
-    "dishwasher": ApplianceType.WASHER,
-}
-
-# Base URL for SmartHQ REST API
-_SMARTHQ_BASE_URL = "https://api.smarthq.com/v1"
+def _ge_type_to_our_type(ge_type_str: str) -> ApplianceType:
+    s = ge_type_str.lower()
+    if "dryer" in s:
+        return ApplianceType.DRYER
+    if "washer" in s or "laundry" in s:
+        return ApplianceType.WASHER
+    if "oven" in s or "range" in s or "cook" in s:
+        return ApplianceType.OVEN
+    return ApplianceType.WASHER
 
 
-def _map_status(raw_status: str) -> ApplianceStatus:
-    return _SMARTHQ_STATUS_MAP.get(raw_status.upper(), ApplianceStatus.UNKNOWN)
+def _laundry_state_to_status(raw_state: Any) -> ApplianceStatus:
+    if raw_state is None:
+        return ApplianceStatus.UNKNOWN
+    s = str(raw_state).upper()
+    if any(k in s for k in ("RUNNING", "SENSING", "FILLING", "SOAKING",
+                             "WASHING", "RINSING", "SPINNING", "DRYING",
+                             "COOL_DOWN", "DELAY", "IN_USE")):
+        return ApplianceStatus.RUNNING
+    if any(k in s for k in ("END", "DONE", "COMPLETE", "FINISHED")):
+        return ApplianceStatus.DONE
+    return ApplianceStatus.IDLE
 
 
-def _map_type(raw_type: str) -> ApplianceType:
-    return _SMARTHQ_TYPE_MAP.get(raw_type.lower(), ApplianceType.WASHER)
+def _oven_state_to_status(raw_state: Any) -> ApplianceStatus:
+    if raw_state is None:
+        return ApplianceStatus.UNKNOWN
+    s = str(raw_state).upper()
+    if any(k in s for k in ("PREHEAT", "COOK", "BAKE", "BROIL",
+                             "ROAST", "WARM", "PROOF", "CONV", "SELF_CLEAN")):
+        return ApplianceStatus.RUNNING
+    if any(k in s for k in ("DONE", "END", "COMPLETE")):
+        return ApplianceStatus.DONE
+    return ApplianceStatus.IDLE
 
 
-def _build_status_detail(appliance_data: Dict[str, Any]) -> str:
-    """Compose a human-readable status detail string from raw appliance data."""
-    attributes = appliance_data.get("attributes", {})
-    cycle_name: str = (
-        attributes.get("cycleName")
-        or attributes.get("selectedCycle")
-        or attributes.get("cycleSelected")
-        or ""
-    )
-    time_remaining: Optional[int] = (
-        attributes.get("timeRemaining")
-        or attributes.get("remainingTime")
-        or attributes.get("cycleTimeRemaining")
-    )
+def _extract_ge_appliance(ge_appliance: Any) -> Optional[Appliance]:
+    """Convert a gehomesdk GeAppliance into our Appliance model."""
+    try:
+        from gehomesdk.erd import ErdCode
 
-    raw_status: str = (
-        appliance_data.get("applianceState")
-        or appliance_data.get("operationMode")
-        or "UNKNOWN"
-    )
-    status = _map_status(raw_status)
+        mac = ge_appliance.mac_addr
 
-    if status == ApplianceStatus.RUNNING:
-        parts = []
-        if cycle_name:
-            parts.append(cycle_name.replace("_", " ").title())
-        if time_remaining is not None:
-            parts.append(f"{time_remaining} mins left")
-        return " · ".join(parts) if parts else "Running"
-    elif status == ApplianceStatus.DONE:
-        return "Cycle complete"
-    elif status == ApplianceStatus.IDLE:
-        return "Idle"
-    elif status == ApplianceStatus.ERROR:
-        fault = attributes.get("faultCode") or attributes.get("errorCode") or "Unknown error"
-        return f"Error: {fault}"
-    return "Unknown"
+        # Appliance type
+        try:
+            raw_type = ge_appliance.get_erd_value(ErdCode.APPLIANCE_TYPE)
+            our_type = _ge_type_to_our_type(str(raw_type)) if raw_type else ApplianceType.WASHER
+        except Exception:
+            our_type = ApplianceType.WASHER
+
+        # Display name
+        name = {
+            ApplianceType.WASHER: "Smart Washer",
+            ApplianceType.DRYER: "Smart Dryer",
+            ApplianceType.OVEN: "Smart Oven",
+        }.get(our_type, "GE Appliance")
+
+        # Status + details
+        status = ApplianceStatus.IDLE
+        status_detail = "Idle"
+        minutes_remaining: Optional[int] = None
+
+        if our_type in (ApplianceType.WASHER, ApplianceType.DRYER):
+            try:
+                machine_state = ge_appliance.get_erd_value(ErdCode.LAUNDRY_MACHINE_STATE)
+                status = _laundry_state_to_status(machine_state)
+            except Exception:
+                pass
+            try:
+                tr = ge_appliance.get_erd_value(ErdCode.LAUNDRY_TIME_REMAINING)
+                if tr is not None:
+                    minutes_remaining = int(tr)
+            except Exception:
+                pass
+            try:
+                cycle = ge_appliance.get_erd_value(ErdCode.LAUNDRY_CYCLE)
+                if cycle:
+                    cycle_str = str(cycle).replace("_", " ").title()
+                    if minutes_remaining:
+                        status_detail = f"{cycle_str} · {minutes_remaining}m left"
+                    else:
+                        status_detail = cycle_str
+                elif status == ApplianceStatus.RUNNING:
+                    status_detail = "Running"
+                elif status == ApplianceStatus.DONE:
+                    status_detail = "Cycle complete"
+            except Exception:
+                if status == ApplianceStatus.RUNNING:
+                    status_detail = "Running"
+                elif status == ApplianceStatus.DONE:
+                    status_detail = "Cycle complete"
+
+        elif our_type == ApplianceType.OVEN:
+            for code_name in ("UPPER_OVEN_CURRENT_STATE", "LOWER_OVEN_CURRENT_STATE"):
+                try:
+                    code = getattr(ErdCode, code_name)
+                    oven_state = ge_appliance.get_erd_value(code)
+                    if oven_state:
+                        status = _oven_state_to_status(oven_state)
+                        status_detail = str(oven_state).replace("_", " ").title()
+                        break
+                except Exception:
+                    pass
+
+        return Appliance(
+            id=mac,
+            name=name,
+            type=our_type,
+            status=status,
+            status_detail=status_detail,
+            minutes_remaining=minutes_remaining,
+            is_active=(status == ApplianceStatus.RUNNING),
+            last_updated=datetime.utcnow(),
+        )
+    except Exception as exc:
+        logger.error("Failed to extract appliance %s: %s",
+                     getattr(ge_appliance, "mac_addr", "?"), exc)
+        return None
 
 
-def _parse_appliance(raw: Dict[str, Any]) -> Appliance:
-    """Convert a raw SmartHQ appliance dict to an Appliance model."""
-    appliance_id: str = str(raw.get("applianceId") or raw.get("id") or "unknown")
-    name: str = raw.get("nickname") or raw.get("name") or raw.get("modelNumber") or appliance_id
-    raw_type: str = raw.get("type") or raw.get("applianceType") or "washer"
-    raw_status: str = (
-        raw.get("applianceState") or raw.get("operationMode") or "UNKNOWN"
-    )
-
-    attributes = raw.get("attributes", {})
-    time_remaining: Optional[int] = (
-        attributes.get("timeRemaining")
-        or attributes.get("remainingTime")
-        or attributes.get("cycleTimeRemaining")
-    )
-
-    status = _map_status(raw_status)
-
-    return Appliance(
-        id=appliance_id,
-        name=name,
-        type=_map_type(raw_type),
-        status=status,
-        status_detail=_build_status_detail(raw),
-        minutes_remaining=int(time_remaining) if time_remaining is not None else None,
-        is_active=(status == ApplianceStatus.RUNNING),
-        last_updated=datetime.utcnow(),
-    )
-
+# ---------------------------------------------------------------------------
+# SmartHQ Service
+# ---------------------------------------------------------------------------
 
 class SmartHQService:
-    """Async client for the SmartHQ Pro REST API.
-
-    Can be used as a singleton (legacy) or as a per-user instance.
-    Pass ``username`` and ``password`` to use per-user credentials; otherwise
-    the class falls back to reading from the global ``Settings``.
-    """
+    """Per-user SmartHQ WebSocket client wrapper."""
 
     def __init__(
         self,
         username: Optional[str] = None,
         password: Optional[str] = None,
         api_key: Optional[str] = None,
-        base_url: str = _SMARTHQ_BASE_URL,
+        base_url: Optional[str] = None,
     ) -> None:
-        # Explicit per-user credentials take priority over settings.
         self._username: str = username or ""
         self._password: str = password or ""
-        self._bearer_token: str = api_key or ""
-        self._base_url: str = base_url
-        self._client: Optional[httpx.AsyncClient] = None
+        self._ge_client: Any = None
+        self._run_task: Optional[asyncio.Task] = None
+        self._ready_event: asyncio.Event = asyncio.Event()
+        self._state_change_callback: Optional[Callable] = None
 
-        # If no explicit credentials and no api_key, try reading from settings
-        # (legacy singleton path only).
-        if not self._username and not self._bearer_token:
+        if not self._username:
             try:
                 from config import get_settings
-                settings = get_settings()
-                self._bearer_token = settings.smarthq_api_key
-                self._username = settings.smarthq_username
-                self._password = settings.smarthq_password
-                self._base_url = settings.smarthq_base_url
+                s = get_settings()
+                self._username = s.smarthq_username
+                self._password = s.smarthq_password
             except Exception:
-                pass  # Settings may not be available in tests
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+                pass
 
     async def start(self) -> None:
-        """Create the shared httpx client and authenticate if needed."""
-        self._client = httpx.AsyncClient(
-            base_url=self._base_url,
-            timeout=httpx.Timeout(15.0),
-        )
-        if not self._bearer_token and self._username:
-            await self._login()
+        """Connect to GE SmartHQ and wait up to 20s for appliance discovery."""
+        if not self._username or not self._password:
+            logger.info("SmartHQ: no credentials, skipping.")
+            return
+
+        try:
+            from gehomesdk import (GeWebsocketClient,
+                                   EVENT_GOT_APPLIANCE_LIST,
+                                   EVENT_APPLIANCE_STATE_CHANGE)
+            from aiohttp import ClientSession
+
+            self._ge_client = GeWebsocketClient(self._username, self._password)
+
+            async def _on_got_list(data: Any) -> None:
+                count = len(data) if data else 0
+                logger.info("SmartHQ: appliance list received (%d devices).", count)
+                self._ready_event.set()
+
+            async def _on_state_change(data: Any) -> None:
+                if self._state_change_callback:
+                    ge_app = data[0] if isinstance(data, (list, tuple)) else data
+                    our = _extract_ge_appliance(ge_app)
+                    if our:
+                        await self._state_change_callback(our)
+
+            self._ge_client.add_event_handler(EVENT_GOT_APPLIANCE_LIST, _on_got_list)
+            self._ge_client.add_event_handler(EVENT_APPLIANCE_STATE_CHANGE, _on_state_change)
+
+            async def _run() -> None:
+                async with ClientSession() as session:
+                    await self._ge_client.async_get_credentials_and_run(session)
+
+            self._run_task = asyncio.create_task(_run())
+
+            # Wait up to 20s for the initial appliance list
+            try:
+                await asyncio.wait_for(asyncio.shield(self._ready_event.wait()), timeout=20.0)
+                logger.info("SmartHQ: ready for %s (%d appliances).",
+                            self._username, len(self._ge_client.appliances))
+            except asyncio.TimeoutError:
+                logger.warning("SmartHQ: timed out for %s — connection may still succeed.",
+                               self._username)
+
+        except Exception as exc:
+            logger.error("SmartHQ start() failed for %s: %s", self._username, exc)
+
+    async def start_with_auth_code(self, auth_code: str) -> None:
+        """Connect to GE SmartHQ using an OAuth2 authorization code.
+
+        The phone obtained this code by loading GE's login page in a WebView
+        (not blocked by CAPTCHA).  We exchange it for tokens here on the
+        server (this token endpoint call is not CAPTCHA-protected), then
+        connect to the SmartHQ WebSocket directly without scraping HTML.
+        """
+        try:
+            from gehomesdk import (GeWebsocketClient,
+                                   EVENT_GOT_APPLIANCE_LIST,
+                                   EVENT_APPLIANCE_STATE_CHANGE)
+            from gehomesdk.clients.const import (
+                OAUTH2_CLIENT_ID, OAUTH2_CLIENT_SECRET,
+                OAUTH2_REDIRECT_URI, LOGIN_URL,
+            )
+            from aiohttp import ClientSession, BasicAuth
+
+            # Exchange the auth code for access + refresh tokens.
+            post_data = {
+                "code": auth_code,
+                "client_id": OAUTH2_CLIENT_ID,
+                "client_secret": OAUTH2_CLIENT_SECRET,
+                "redirect_uri": OAUTH2_REDIRECT_URI,
+                "grant_type": "authorization_code",
+            }
+            async with ClientSession() as tmp:
+                basic = BasicAuth(OAUTH2_CLIENT_ID, OAUTH2_CLIENT_SECRET)
+                async with tmp.post(
+                    f"{LOGIN_URL}/oauth2/token",
+                    data=post_data,
+                    auth=basic,
+                ) as resp:
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        raise ValueError(
+                            f"Token exchange failed ({resp.status}): {body}"
+                        )
+                    token_data = await resp.json()
+
+            access_token: Optional[str] = token_data.get("access_token")
+            refresh_token: Optional[str] = token_data.get("refresh_token")
+            if not access_token:
+                raise ValueError(f"No access_token in token response: {token_data}")
+
+            logger.info("SmartHQ: token exchange succeeded — connecting WebSocket.")
+
+            # Create a GeWebsocketClient, inject tokens, get WSS endpoint.
+            self._ge_client = GeWebsocketClient("", "")
+
+            async def _on_got_list(data: Any) -> None:
+                count = len(data) if data else 0
+                logger.info("SmartHQ: appliance list received (%d devices).", count)
+                self._ready_event.set()
+
+            async def _on_state_change(data: Any) -> None:
+                if self._state_change_callback:
+                    ge_app = data[0] if isinstance(data, (list, tuple)) else data
+                    our = _extract_ge_appliance(ge_app)
+                    if our:
+                        await self._state_change_callback(our)
+
+            self._ge_client.add_event_handler(EVENT_GOT_APPLIANCE_LIST, _on_got_list)
+            self._ge_client.add_event_handler(EVENT_APPLIANCE_STATE_CHANGE, _on_state_change)
+
+            async def _run() -> None:
+                async with ClientSession() as session:
+                    # Inject the tokens so the client skips HTML login.
+                    self._ge_client._session = session
+                    self._ge_client._access_token = access_token
+                    self._ge_client._refresh_token = refresh_token
+                    # Get WebSocket endpoint via the REST API (uses Bearer token).
+                    wss_creds = await self._ge_client._async_get_wss_credentials()
+                    self._ge_client.credentials = wss_creds
+                    # Run WebSocket loop (reconnects use refresh token, not HTML login).
+                    await self._ge_client.async_run_client()
+
+            self._run_task = asyncio.create_task(_run())
+
+            # Wait up to 20s for the initial appliance list.
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._ready_event.wait()), timeout=20.0
+                )
+                logger.info(
+                    "SmartHQ: ready via OAuth code (%d appliances).",
+                    len(self._ge_client.appliances),
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "SmartHQ: timed out waiting for appliances — "
+                    "connection may still succeed in the background."
+                )
+
+        except Exception as exc:
+            logger.error("SmartHQ start_with_auth_code() failed: %s", exc)
+            raise
 
     async def stop(self) -> None:
-        if self._client:
-            await self._client.aclose()
-            self._client = None
-
-    # ------------------------------------------------------------------
-    # Auth
-    # ------------------------------------------------------------------
-
-    async def _login(self) -> None:
-        """Obtain a bearer token via username/password login."""
-        assert self._client is not None
-        try:
-            response = await self._client.post(
-                "/auth/token",
-                json={
-                    "username": self._username,
-                    "password": self._password,
-                    "grant_type": "password",
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-            self._bearer_token = data.get("access_token") or data.get("token") or ""
-            logger.info("SmartHQ login successful for user %s.", self._username)
-        except httpx.HTTPStatusError as exc:
-            logger.error(
-                "SmartHQ login failed for %s (%s): %s",
-                self._username,
-                exc.response.status_code,
-                exc,
-            )
-            raise
-        except Exception as exc:
-            logger.error("SmartHQ login error for %s: %s", self._username, exc)
-            raise
-
-    def _auth_headers(self) -> Dict[str, str]:
-        headers: Dict[str, str] = {"Accept": "application/json"}
-        if self._bearer_token:
-            headers["Authorization"] = f"Bearer {self._bearer_token}"
-        return headers
-
-    # ------------------------------------------------------------------
-    # API calls
-    # ------------------------------------------------------------------
-
-    async def _get(self, path: str) -> Optional[Any]:
-        """Perform a GET request, refreshing the token once on 401."""
-        assert self._client is not None, "SmartHQService.start() was not called"
-
-        for attempt in range(2):
+        if self._ge_client:
             try:
-                response = await self._client.get(path, headers=self._auth_headers())
-                if response.status_code == 401 and attempt == 0:
-                    logger.warning("SmartHQ 401 – attempting re-login for %s.", self._username)
-                    await self._login()
-                    continue
-                response.raise_for_status()
-                return response.json()
-            except httpx.HTTPStatusError as exc:
-                logger.error(
-                    "SmartHQ HTTP error on GET %s (%s): %s",
-                    path,
-                    exc.response.status_code,
-                    exc,
-                )
-                return None
-            except Exception as exc:
-                logger.error("SmartHQ request error on GET %s: %s", path, exc)
-                return None
-        return None
+                self._ge_client.disconnect()
+            except Exception:
+                pass
+        if self._run_task:
+            self._run_task.cancel()
+            try:
+                await self._run_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._run_task = None
+        self._ge_client = None
 
     async def fetch_all_appliances(self) -> List[Appliance]:
-        """Fetch and parse all appliances from SmartHQ.
-
-        TODO: If using gehomesdk, replace this method body with:
-
-            from gehomesdk import GeApiClient
-            # GeApiClient is already authenticated (constructed with username/password
-            # and logged in via async_login()).  Call:
-            #   raw_appliances = await ge_client.async_get_appliances()
-            # Then map each item to our internal Appliance model using _parse_appliance()
-            # or a custom mapping.
-        """
-        if self._client is None:
-            logger.warning(
-                "SmartHQService.fetch_all_appliances called before start() — returning empty list."
-            )
+        """Return current appliance state from the live WebSocket connection."""
+        if not self._ge_client:
             return []
+        results = []
+        for ge_app in self._ge_client.appliances.values():
+            our = _extract_ge_appliance(ge_app)
+            if our:
+                results.append(our)
+        return results
 
-        data = await self._get("/appliances")
-        if data is None:
-            return []
-
-        # The API may return a list directly or wrap it in a key.
-        raw_list: List[Dict[str, Any]]
-        if isinstance(data, list):
-            raw_list = data
-        elif isinstance(data, dict):
-            raw_list = (
-                data.get("appliances")
-                or data.get("data")
-                or data.get("items")
-                or []
-            )
-        else:
-            logger.warning("Unexpected SmartHQ response shape: %s", type(data))
-            return []
-
-        appliances: List[Appliance] = []
-        for raw in raw_list:
-            try:
-                appliances.append(_parse_appliance(raw))
-            except Exception as exc:
-                logger.error("Failed to parse appliance: %s – %s", raw, exc)
-
-        logger.debug("SmartHQ: fetched %d appliances.", len(appliances))
-        return appliances
-
-    async def fetch_appliance(self, appliance_id: str) -> Optional[Appliance]:
-        """Fetch a single appliance by ID."""
-        if self._client is None:
-            return None
-        data = await self._get(f"/appliances/{appliance_id}")
-        if data is None:
-            return None
-        try:
-            if isinstance(data, dict) and "appliance" in data:
-                data = data["appliance"]
-            return _parse_appliance(data)
-        except Exception as exc:
-            logger.error("Failed to parse appliance %s: %s", appliance_id, exc)
-            return None
+    def set_state_change_callback(self, callback: Callable) -> None:
+        self._state_change_callback = callback
 
     @property
     def is_ready(self) -> bool:
-        """True if the client is initialised and has a token."""
-        return self._client is not None and bool(self._bearer_token)
+        return self._ge_client is not None and self._ready_event.is_set()
 
 
-# ---------------------------------------------------------------------------
-# Legacy singleton — kept for health-check compatibility.
-# The per-user sessions use their own SmartHQService instances instead.
-# ---------------------------------------------------------------------------
-
+# Legacy singleton used by health-check only.
 smarthq_service = SmartHQService()

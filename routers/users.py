@@ -37,7 +37,7 @@ router = APIRouter(prefix="/users", tags=["users"])
 class RegisterRequest(BaseModel):
     smarthq_username: str = Field(..., description="SmartHQ account email address")
     smarthq_password: str = Field(..., min_length=1, description="SmartHQ account password")
-    fcm_token: str = Field(..., min_length=1, description="Firebase Cloud Messaging device token")
+    fcm_token: str = Field(default="pending", description="Firebase Cloud Messaging device token")
 
     @field_validator("smarthq_username")
     @classmethod
@@ -45,6 +45,19 @@ class RegisterRequest(BaseModel):
         v = v.strip()
         if not v:
             raise ValueError("smarthq_username must not be empty")
+        return v
+
+
+class RegisterWithCodeRequest(BaseModel):
+    auth_code: str = Field(..., min_length=1, description="GE OAuth2 authorization code from WebView login")
+    fcm_token: str = Field(default="pending", description="Firebase Cloud Messaging device token")
+
+    @field_validator("auth_code")
+    @classmethod
+    def code_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("auth_code must not be empty")
         return v
 
 
@@ -126,6 +139,46 @@ async def register_user(
 
     appliances = list(session.appliances.values())
     return RegisterResponse(user_id=user_id, appliances=appliances)
+
+
+@router.post(
+    "/register-with-code",
+    response_model=RegisterResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Register a user via GE OAuth2 authorization code (WebView login)",
+    description=(
+        "The Android app loads GE's OAuth2 login page in a WebView on the phone "
+        "(not blocked by CAPTCHA).  After the user authenticates, GE redirects to "
+        "the redirect URI containing an authorization code.  The app sends that code "
+        "here; the backend exchanges it for access+refresh tokens and opens the "
+        "SmartHQ WebSocket connection.  No username/password is stored."
+    ),
+)
+async def register_user_with_code(
+    body: RegisterWithCodeRequest,
+    user_id: str = Depends(get_current_user_id),
+) -> RegisterResponse:
+    logger.info("Registering user=%s via OAuth2 code", user_id)
+
+    try:
+        session = await user_session_manager.register_user_with_code(
+            user_id=user_id,
+            auth_code=body.auth_code,
+            fcm_token=body.fcm_token,
+        )
+    except Exception as exc:
+        logger.error("Failed to register user=%s via code: %s", user_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Could not connect to SmartHQ: {exc}",
+        )
+
+    appliances = list(session.appliances.values())
+    return RegisterResponse(
+        user_id=user_id,
+        appliances=appliances,
+        message="Connected via OAuth2 login.",
+    )
 
 
 @router.delete(
