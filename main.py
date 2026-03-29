@@ -220,28 +220,36 @@ async def connectivity_test() -> dict:
                     results[f"http_{url}"] = f"ok ({r.status})"
         except Exception as e:
             results[f"http_{url}"] = f"FAILED: {type(e).__name__}: {e}"
-    # Check gehomesdk version and login page structure
-    try:
-        import gehomesdk
-        results["gehomesdk_version"] = getattr(gehomesdk, "__version__", "unknown")
-    except Exception as e:
-        results["gehomesdk_version"] = f"error: {e}"
+    # Attempt full login flow and capture exact error
     try:
         async with aiohttp.ClientSession() as s:
             from gehomesdk.clients.const import LOGIN_URL, OAUTH2_CLIENT_ID, OAUTH2_REDIRECT_URI
+            from gehomesdk.clients.async_login_flows import set_login_cookie, extract_form_inputs
             params = {
                 'client_id': OAUTH2_CLIENT_ID,
                 'response_type': 'code',
                 'access_type': 'offline',
                 'redirect_uri': OAUTH2_REDIRECT_URI,
             }
+            set_login_cookie(s, "US")
             async with s.get(f'{LOGIN_URL}/oauth2/auth', params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                text = await r.text()
-                has_form = 'frmsignin' in text
-                has_username = 'username' in text
-                results["ge_login_page"] = f"status={r.status} has_form={has_form} has_username_field={has_username} len={len(text)}"
+                auth_page_status = r.status
+                auth_page_text = await r.text()
+                form_fields = list(extract_form_inputs(auth_page_text, 'frmsignin').keys())
+            results["ge_auth_page"] = f"status={auth_page_status} form_fields={form_fields}"
+            # Try submitting credentials
+            post_data = extract_form_inputs(auth_page_text, 'frmsignin')
+            post_data['username'] = "diag_test@example.com"
+            post_data['password'] = "diag_test_pass"
+            async with s.post(f'{LOGIN_URL}/oauth2/g_authenticate', data=post_data,
+                              allow_redirects=False, timeout=aiohttp.ClientTimeout(total=10)) as r2:
+                loc = r2.headers.get('Location', 'none')
+                body2 = await r2.text()
+                results["ge_submit"] = f"status={r2.status} location={loc[:80] if loc else 'none'} body_len={len(body2)}"
+                if r2.status == 200:
+                    results["ge_submit_body_snippet"] = body2[:300]
     except Exception as e:
-        results["ge_login_page"] = f"FAILED: {type(e).__name__}: {e}"
+        results["ge_login_flow"] = f"{type(e).__name__}: {e}"
     return results
 
 
