@@ -220,20 +220,28 @@ async def connectivity_test() -> dict:
                     results[f"http_{url}"] = f"ok ({r.status})"
         except Exception as e:
             results[f"http_{url}"] = f"FAILED: {type(e).__name__}: {e}"
-    # Try actual gehomesdk login (will fail with wrong creds but shows where it fails)
+    # Check gehomesdk version and login page structure
     try:
-        from gehomesdk import GeWebsocketClient
-        import asyncio
-        client = GeWebsocketClient("test@test.com", "wrongpass")
-        async with aiohttp.ClientSession() as session:
-            from gehomesdk.clients.async_login_flows import async_get_authorization_code
-            await asyncio.wait_for(
-                async_get_authorization_code(session, "test@test.com", "wrongpass", "US"),
-                timeout=10
-            )
-        results["ge_auth"] = "unexpected success"
+        import gehomesdk
+        results["gehomesdk_version"] = getattr(gehomesdk, "__version__", "unknown")
     except Exception as e:
-        results["ge_auth"] = f"{type(e).__name__}: {e}"
+        results["gehomesdk_version"] = f"error: {e}"
+    try:
+        async with aiohttp.ClientSession() as s:
+            from gehomesdk.clients.const import LOGIN_URL, OAUTH2_CLIENT_ID, OAUTH2_REDIRECT_URI
+            params = {
+                'client_id': OAUTH2_CLIENT_ID,
+                'response_type': 'code',
+                'access_type': 'offline',
+                'redirect_uri': OAUTH2_REDIRECT_URI,
+            }
+            async with s.get(f'{LOGIN_URL}/oauth2/auth', params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                text = await r.text()
+                has_form = 'frmsignin' in text
+                has_username = 'username' in text
+                results["ge_login_page"] = f"status={r.status} has_form={has_form} has_username_field={has_username} len={len(text)}"
+    except Exception as e:
+        results["ge_login_page"] = f"FAILED: {type(e).__name__}: {e}"
     return results
 
 
