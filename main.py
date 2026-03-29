@@ -196,20 +196,44 @@ async def health_check() -> dict:
 async def connectivity_test() -> dict:
     import socket
     import aiohttp
+    import traceback
     results = {}
-    for host in ["accounts.brillion.geappliances.com", "api.brillion.geappliances.com"]:
+    hosts = [
+        "accounts.brillion.geappliances.com",
+        "api.brillion.geappliances.com",
+        "secure.brillion.geappliances.com",
+    ]
+    for host in hosts:
         try:
             addr = socket.getaddrinfo(host, 443)
             ip = addr[0][4][0] if addr else "unknown"
             results[f"dns_{host}"] = f"ok ({ip})"
         except Exception as e:
             results[f"dns_{host}"] = f"FAILED: {e}"
+    for url in [
+        "https://accounts.brillion.geappliances.com",
+        "https://api.brillion.geappliances.com/v1/websocket",
+    ]:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                    results[f"http_{url}"] = f"ok ({r.status})"
+        except Exception as e:
+            results[f"http_{url}"] = f"FAILED: {type(e).__name__}: {e}"
+    # Try actual gehomesdk login (will fail with wrong creds but shows where it fails)
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get("https://accounts.brillion.geappliances.com", timeout=aiohttp.ClientTimeout(total=5)) as r:
-                results["http_accounts"] = f"ok ({r.status})"
+        from gehomesdk import GeWebsocketClient
+        import asyncio
+        client = GeWebsocketClient("test@test.com", "wrongpass")
+        async with aiohttp.ClientSession() as session:
+            from gehomesdk.clients.async_login_flows import async_get_authorization_code
+            await asyncio.wait_for(
+                async_get_authorization_code(session, "test@test.com", "wrongpass", "US"),
+                timeout=10
+            )
+        results["ge_auth"] = "unexpected success"
     except Exception as e:
-        results["http_accounts"] = f"FAILED: {e}"
+        results["ge_auth"] = f"{type(e).__name__}: {e}"
     return results
 
 
