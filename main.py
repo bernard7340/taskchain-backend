@@ -192,6 +192,27 @@ async def health_check() -> dict:
     }
 
 
+@app.get("/connectivity-test", tags=["meta"], summary="Test outbound connectivity to GE servers")
+async def connectivity_test() -> dict:
+    import socket
+    import aiohttp
+    results = {}
+    for host in ["accounts.brillion.geappliances.com", "api.brillion.geappliances.com"]:
+        try:
+            addr = socket.getaddrinfo(host, 443)
+            ip = addr[0][4][0] if addr else "unknown"
+            results[f"dns_{host}"] = f"ok ({ip})"
+        except Exception as e:
+            results[f"dns_{host}"] = f"FAILED: {e}"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://accounts.brillion.geappliances.com", timeout=aiohttp.ClientTimeout(total=5)) as r:
+                results["http_accounts"] = f"ok ({r.status})"
+    except Exception as e:
+        results["http_accounts"] = f"FAILED: {e}"
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Dev-server entry point
 # ---------------------------------------------------------------------------
