@@ -1,44 +1,50 @@
 """Firebase ID-token authentication middleware / dependency.
 
-Usage in FastAPI routes:
-    from middleware.firebase_auth import get_current_user_id
+In LOCAL_MODE (when Firebase credentials are not configured) all requests
+are accepted and assigned the user ID "local_user".  This allows the backend
+to run on a PC connected via USB without any cloud setup, while still
+producing real SmartHQ appliance data.
 
-    @router.get("/protected")
-    async def protected(user_id: str = Depends(get_current_user_id)):
-        ...
-
-The dependency extracts the Firebase ID token from the ``Authorization: Bearer
-<token>`` header, verifies it with the Firebase Admin SDK, and returns the
-authenticated ``uid``.  A 401 is raised when:
-  - The header is missing or malformed.
-  - The token is expired, revoked, or otherwise invalid.
-  - The Firebase Admin SDK is not initialised.
+When Firebase credentials ARE present, tokens are verified normally.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
-import firebase_admin
-from firebase_admin import auth as firebase_auth
 from fastapi import Depends, Header, HTTPException, status
 
 logger = logging.getLogger(__name__)
 
+# If no Firebase credentials are configured, run in local / no-auth mode.
+_LOCAL_MODE_USER = "local_user"
 
-# ---------------------------------------------------------------------------
-# Dependency
-# ---------------------------------------------------------------------------
+
+def _firebase_ready() -> bool:
+    """Return True only if WE explicitly initialised Firebase with real credentials."""
+    from services import fcm_service
+    return fcm_service._firebase_app is not None
 
 
 async def get_current_user_id(
     authorization: Optional[str] = Header(default=None),
 ) -> str:
-    """FastAPI dependency that returns the Firebase UID for the caller.
+    """Return the caller's user ID.
 
-    Raises ``HTTP 401`` for any authentication failure.
+    - If Firebase is not configured: returns ``"local_user"`` for any request
+      so the app works without cloud auth (local USB mode).
+    - If Firebase is configured: verifies the Bearer token and returns the UID.
     """
+    if not _firebase_ready():
+        # Local / dev mode — no auth required.
+        logger.debug("Firebase not configured — using local_user.")
+        return _LOCAL_MODE_USER
+
+    # Firebase is available — enforce proper auth.
+    from firebase_admin import auth as firebase_auth
+
     if not authorization:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -60,16 +66,6 @@ async def get_current_user_id(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Bearer token is empty.",
             headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    # Ensure Firebase Admin SDK is ready.
-    try:
-        firebase_admin.get_app()
-    except ValueError:
-        logger.error("Firebase Admin SDK is not initialised — cannot verify token.")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Authentication service is not available.",
         )
 
     try:
