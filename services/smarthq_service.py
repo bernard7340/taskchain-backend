@@ -297,19 +297,20 @@ class SmartHQService:
 
             self._run_task = asyncio.create_task(_run())
 
-            # Wait up to 20s for the initial appliance list.
+            # Give the WebSocket up to 25 s to connect and receive appliances,
+            # but don't block the HTTP response longer than that.
             try:
                 await asyncio.wait_for(
-                    asyncio.shield(self._ready_event.wait()), timeout=20.0
+                    asyncio.shield(self._ready_event.wait()), timeout=25.0
                 )
                 logger.info(
                     "SmartHQ: ready via OAuth code (%d appliances).",
                     len(self._ge_client.appliances),
                 )
             except asyncio.TimeoutError:
-                logger.warning(
-                    "SmartHQ: timed out waiting for appliances — "
-                    "connection may still succeed in the background."
+                logger.info(
+                    "SmartHQ: still connecting — returning to caller now, "
+                    "WebSocket continues in background."
                 )
 
         except Exception as exc:
