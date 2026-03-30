@@ -263,11 +263,22 @@ class SmartHQService:
             if not access_token:
                 raise ValueError(f"No access_token in token response: {token_data}")
 
-            logger.info("SmartHQ: token exchange succeeded — connecting WebSocket.")
+            logger.info("SmartHQ: token exchange succeeded — getting WSS credentials.")
 
-            # Create a GeWebsocketClient, inject tokens, get WSS endpoint.
+            # Step 1: Get the WebSocket endpoint synchronously so we surface
+            # auth errors immediately (rather than swallowing them in a background task).
             self._ge_client = GeWebsocketClient("", "")
+            self._wss_session = ClientSession()
+            self._ge_client._session = self._wss_session
+            self._ge_client._access_token = access_token
+            self._ge_client._refresh_token = refresh_token
 
+            wss_creds = await self._ge_client._async_get_wss_credentials()
+            self._ge_client.credentials = wss_creds
+            logger.info("SmartHQ: WSS endpoint obtained — user_id=%s",
+                        wss_creds.get("userId", "?"))
+
+            # Step 2: Register event handlers.
             async def _on_got_list(data: Any) -> None:
                 count = len(data) if data else 0
                 logger.info("SmartHQ: appliance list received (%d devices).", count)
@@ -283,17 +294,15 @@ class SmartHQService:
             self._ge_client.add_event_handler(EVENT_GOT_APPLIANCE_LIST, _on_got_list)
             self._ge_client.add_event_handler(EVENT_APPLIANCE_STATE_CHANGE, _on_state_change)
 
+            # Step 3: Launch the WebSocket loop in the background.
+            # The session is kept alive by _wss_session until stop() is called.
             async def _run() -> None:
-                async with ClientSession() as session:
-                    # Inject the tokens so the client skips HTML login.
-                    self._ge_client._session = session
-                    self._ge_client._access_token = access_token
-                    self._ge_client._refresh_token = refresh_token
-                    # Get WebSocket endpoint via the REST API (uses Bearer token).
-                    wss_creds = await self._ge_client._async_get_wss_credentials()
-                    self._ge_client.credentials = wss_creds
-                    # Run WebSocket loop (reconnects use refresh token, not HTML login).
+                try:
                     await self._ge_client.async_run_client()
+                except Exception as exc:
+                    logger.error("SmartHQ WebSocket loop exited: %s", exc)
+                finally:
+                    await self._wss_session.close()
 
             self._run_task = asyncio.create_task(_run())
 
@@ -309,8 +318,9 @@ class SmartHQService:
                 )
             except asyncio.TimeoutError:
                 logger.info(
-                    "SmartHQ: still connecting — returning to caller now, "
-                    "WebSocket continues in background."
+                    "SmartHQ: WebSocket launched, returning to caller "
+                    "(%d appliances so far).",
+                    len(self._ge_client.appliances) if self._ge_client else 0,
                 )
 
         except Exception as exc:
